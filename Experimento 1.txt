@@ -1,0 +1,150 @@
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from fpylll import IntegerMatrix, LLL
+from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, transpile
+from qiskit_aer import AerSimulator
+from qiskit.circuit.library import UnitaryGate, QFT
+from qiskit.quantum_info import Statevector
+
+# --- CONSTRUCTION MODULES ---
+def discrete_gaussian_state(n: int, R: float) -> QuantumCircuit:
+    M_dim = 2 ** n
+    domain = np.arange(M_dim)
+    center = M_dim / 2.0
+    amplitudes = np.exp(-((domain - center) ** 2) / (R ** 2))
+    norm_factor = np.sqrt(np.sum(amplitudes ** 2))
+    qc = QuantumCircuit(QuantumRegister(n, name='z'))
+    qc.initialize(amplitudes / norm_factor, qc.qubits)
+    return qc
+
+def create_modular_multiplier(base: int, power: int, N: int, num_out_qubits: int) -> UnitaryGate:
+    dim = 2 ** num_out_qubits
+    matrix = np.zeros((dim, dim))
+    multiplier = pow(base, power, N)
+    for i in range(dim):
+        if i < N: matrix[(i * multiplier) % N, i] = 1.0
+        else: matrix[i, i] = 1.0
+    return UnitaryGate(matrix, label=f"*{base}^{power} mod {N}")
+
+def build_oracle(bases: list, N: int, z_regs: list, out_reg: QuantumRegister) -> QuantumCircuit:
+    qc = QuantumCircuit(*z_regs, out_reg)
+    for base, z_reg in zip(bases, z_regs):
+        for bit_idx in range(z_reg.size):
+            c_mult = create_modular_multiplier(base, 2**bit_idx, N, out_reg.size).control(1)
+            qc.append(c_mult, [z_reg[bit_idx]] + list(out_reg))
+    return qc
+
+def apply_multidimensional_qft(z_regs: list) -> QuantumCircuit:
+    qc = QuantumCircuit(*z_regs)
+    for z_reg in z_regs:
+        qc.append(QFT(z_reg.size, do_swaps=True, inverse=False).to_instruction(), z_reg)
+    return qc
+
+# --- MATHEMATICAL TOOLS ---
+def is_prime(num: int) -> bool:
+    if num < 2: return False
+    for i in range(2, int(math.sqrt(num)) + 1):
+        if num % i == 0: return False
+    return True
+
+# --- EXPERIMENT ORCHESTRATOR ---
+if __name__ == "__main__":
+    shots = 15
+    num_trials = 50
+
+    # Iteration over the target cryptographic moduli
+    for N in [15, 21]:
+        print(f"\n==========================================")
+        print(f" EXPERIMENT 1: FACTORING N={N}")
+        print(f"==========================================")
+
+        n = N.bit_length()
+        d = max(2, math.ceil(math.sqrt(n)))
+        M = 2 ** n  # Spatial dimension modulus
+
+        # Automatic prime base search
+        bases = []
+        candidate_base = 2
+        while len(bases) < d:
+            if is_prime(candidate_base) and math.gcd(candidate_base, N) == 1:
+                bases.append(candidate_base)
+            candidate_base += 1
+
+        print(f"Configuration -> n: {n}, d: {d}, Bases: {bases}, M: {M}")
+
+        z_regs = [QuantumRegister(n, name=f'z{i}') for i in range(d)]
+        out_reg = QuantumRegister(n, name='out')
+        c_regs = [ClassicalRegister(n, name=f'c{i}') for i in range(d)]
+
+        qc = QuantumCircuit(*z_regs, out_reg, *c_regs)
+        qc_ideal = QuantumCircuit(*z_regs, out_reg)
+
+        # State preparation
+        gaussian = discrete_gaussian_state(n, float(M * 0.35))
+        for z_reg in z_regs:
+            qc.compose(gaussian, qubits=z_reg, inplace=True)
+            qc_ideal.compose(gaussian, qubits=z_reg, inplace=True)
+
+        qc.x(out_reg[0])
+        qc_ideal.x(out_reg[0])
+        oracle = build_oracle(bases, N, z_regs, out_reg)
+        qc.compose(oracle, inplace=True)
+        qc_ideal.compose(oracle, inplace=True)
+        qft = apply_multidimensional_qft(z_regs)
+        qc.compose(qft, inplace=True)
+        qc_ideal.compose(qft, inplace=True)
+
+        # 1. CLEAN FIGURE GENERATION (Ideal Statevector)
+        probabilities = Statevector.from_instruction(qc_ideal).probabilities_dict()
+        max_prob = max(probabilities.values())
+        peaks = [v for v in probabilities.values() if v >= max_prob * 0.5]
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.bar(range(len(peaks)), peaks, color='midnightblue', width=0.8)
+        ax.set_title(f"Ideal QFT Output Spectrum (N={N})", fontsize=14, fontweight='bold')
+        ax.set_ylabel("Probability")
+        ax.set_xticks([])
+        ax.spines[['top', 'right', 'bottom']].set_visible(False)
+        filename = f'ideal_distribution_N{N}.pdf'
+        fig.savefig(filename, bbox_inches='tight', dpi=300)
+        print(f"  -> Figure saved: '{filename}'")
+
+        # 2. 50-TRIAL LOOP (Success Rate Calculation)
+        for i, z_reg in enumerate(z_regs):
+            qc.measure(z_reg, c_regs[i])
+
+        sim = AerSimulator()
+        qc_t = transpile(qc, sim, optimization_level=3)
+
+        successes = 0
+        for _ in range(num_trials):
+            res = sim.run(qc_t, shots=shots, memory=True).result()
+            # Processed without .reverse() or [::-1] to match Qiskit's Little-Endian formatting
+            k_raw = [list(tuple(int(m, 2) for m in b.split())) for b in list(set(res.get_memory()))[:d+4]]
+
+            K = IntegerMatrix(d + len(k_raw), d + len(k_raw))
+            S = 100000  # Algorithmic noise penalty scalar
+
+            for i in range(d):
+                K[i, i] = 1
+                for j, m_val in enumerate(k_raw):
+                    # Normalize by the dynamic modulus M
+                    K[i, d + j] = int(S * m_val[i] / M)
+            for j in range(len(k_raw)):
+                K[d + j, d + j] = S
+
+            LLL.reduction(K)
+
+            for r in range(K.nrows):
+                z = [abs(K[r, i]) for i in range(d)]
+                if any(c % 2 != 0 for c in z) or all(c == 0 for c in z): continue
+
+                b = 1
+                for i in range(d):
+                    b = (b * pow(bases[i], z[i]//2, N)) % N
+                if b != 1 and b != N-1 and (b*b)%N == 1:
+                    successes += 1
+                    break
+
+        print(f"  -> Pipeline finished. Success rate: {(successes/num_trials)*100:.2f}%")

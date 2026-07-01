@@ -1,0 +1,203 @@
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, transpile
+from qiskit_aer import AerSimulator
+from qiskit_aer.noise import NoiseModel, depolarizing_error
+from qiskit.quantum_info import hellinger_fidelity
+from qiskit.circuit.library import UnitaryGate, QFT
+
+# ==========================================
+# QUANTUM MODULES
+# ==========================================
+def discrete_gaussian_state(n: int, R: float) -> QuantumCircuit:
+    M_dim = 2 ** n
+    domain = np.arange(M_dim)
+    center = M_dim / 2.0
+    amplitudes = np.exp(-((domain - center) ** 2) / (R ** 2))
+    norm_factor = np.sqrt(np.sum(amplitudes ** 2))
+    qr = QuantumRegister(n, name='z')
+    qc = QuantumCircuit(qr)
+    qc.initialize(amplitudes / norm_factor, qr)
+    return qc
+
+def create_modular_multiplier(base: int, power: int, N: int, num_out_qubits: int) -> UnitaryGate:
+    dim = 2 ** num_out_qubits
+    matrix = np.zeros((dim, dim))
+    multiplier = pow(base, power, N)
+    for i in range(dim):
+        if i < N:
+            mapped_val = (i * multiplier) % N
+            matrix[mapped_val, i] = 1.0
+        else:
+            matrix[i, i] = 1.0
+    return UnitaryGate(matrix, label=f"*{base}^{power} mod {N}")
+
+def build_oracle(bases: list, N: int, z_regs: list, out_reg: QuantumRegister) -> QuantumCircuit:
+    num_out = out_reg.size
+    qc = QuantumCircuit(*z_regs, out_reg)
+    for dim_idx, (base, z_reg) in enumerate(zip(bases, z_regs)):
+        for bit_idx in range(z_reg.size):
+            power = 2 ** bit_idx
+            mult_gate = create_modular_multiplier(base, power, N, num_out)
+            c_mult_gate = mult_gate.control(1)
+            qc.append(c_mult_gate, [z_reg[bit_idx]] + list(out_reg))
+    return qc
+
+def apply_multidimensional_qft(z_regs: list) -> QuantumCircuit:
+    qc = QuantumCircuit(*z_regs)
+    for z_reg in z_regs:
+        num_qubits = z_reg.size
+        qft_inst = QFT(num_qubits, do_swaps=True, inverse=False).to_instruction()
+        qc.append(qft_inst, z_reg)
+    return qc
+
+#Prime search code
+def is_prime(num: int) -> bool:
+    if num < 2: return False
+    for i in range(2, int(math.sqrt(num)) + 1):
+        if num % i == 0: return False
+    return True
+
+# ==========================================
+# EXPERIMENT 3: NISQ NOISE SENSITIVITY
+# ==========================================
+if __name__ == "__main__":
+    n = 4
+    N = 15
+    d = max(2, math.ceil(math.sqrt(n)))
+
+    # Search engine
+    bases = []
+    candidate = 2
+    while len(bases) < d:
+        if is_prime(candidate) and math.gcd(candidate, N) == 1:
+            bases.append(candidate)
+        candidate += 1
+
+    print(f"Selected mathematical bases for N={N}: {bases}")
+
+    shots = 100
+    M = 2 ** n
+    R = float(M * 0.35)
+
+    print("\n=====================================================================")
+    print(" EXPERIMENT 3: DEPOLARIZING NOISE SENSITIVITY ANALYSIS")
+    print("=====================================================================\n")
+
+    # 1. Circuit Assembly
+    z_regs = [QuantumRegister(n, name=f'z{i}') for i in range(d)]
+    out_reg = QuantumRegister(n, name='out')
+    c_regs = [ClassicalRegister(n, name=f'c{i}') for i in range(d)]
+
+    qc = QuantumCircuit(*z_regs, out_reg, *c_regs)
+
+    qc_gauss = discrete_gaussian_state(n, R)
+    for z_reg in z_regs:
+        qc.compose(qc_gauss, qubits=z_reg, inplace=True)
+
+    qc.x(out_reg[0])
+
+    oracle = build_oracle(bases, N, z_regs, out_reg)
+    qc.compose(oracle, inplace=True)
+
+    qft_block = apply_multidimensional_qft(z_regs)
+    qc.compose(qft_block, inplace=True)
+
+    for i, z_reg in enumerate(z_regs):
+        qc.measure(z_reg, c_regs[i])
+
+    # 2. Physical Transpilation (Homogenized and unconstrained)
+    simulator = AerSimulator()
+    print("[*] Transpiling circuit (Optimization Level 3)...")
+    transpiled_qc = transpile(qc, simulator, optimization_level=3)
+
+    # --- DYNAMIC GATE ROUTING FOR THE NOISE MODEL ---
+    gates_1q = set()
+    gates_2q = set()
+
+    for instruction in transpiled_qc.data:
+        inst_name = instruction.operation.name
+        if inst_name not in ['measure', 'barrier']:
+            num_qubits = instruction.operation.num_qubits
+            if num_qubits == 1:
+                gates_1q.add(inst_name)
+            elif num_qubits == 2:
+                gates_2q.add(inst_name)
+
+    gates_1q = list(gates_1q)
+    gates_2q = list(gates_2q)
+
+    print(f"[+] Transpilation completed. Physical Depth: {transpiled_qc.depth()}")
+    print(f"[+] Dynamic 1Q gates extracted: {gates_1q}")
+    print(f"[+] Dynamic 2Q gates extracted: {gates_2q}\n")
+
+    # 3. IDEAL Simulation (Baseline)
+    print("[*] Executing IDEAL simulation (0 noise)...")
+    result_ideal = simulator.run(transpiled_qc, shots=10000).result()
+    counts_ideal = result_ideal.get_counts()
+
+    total_ideal = sum(counts_ideal.values())
+    valid_peaks = {k for k, v in counts_ideal.items() if (v / total_ideal) > 0.01}
+
+    # 4. Noise Sweep
+    error_rates = [1e-4, 1e-3, 1e-2, 5e-2]
+    fidelities = []
+    success_probs = []
+
+    print(f"{'Error Rate (p)':<15} | {'Fidelity':<12} | {'Success Probability'}")
+    print("-" * 60)
+
+    for p in error_rates:
+        noise_model = NoiseModel()
+        error_1q = depolarizing_error(p, 1)
+        # Scaled proportional error for two-qubit entangling gates
+        error_2q = depolarizing_error(min(p * 10, 1.0), 2)
+
+        # Apply noise dynamically based on the actual transpired topology
+        if gates_1q:
+            noise_model.add_all_qubit_quantum_error(error_1q, gates_1q)
+        if gates_2q:
+            noise_model.add_all_qubit_quantum_error(error_2q, gates_2q)
+
+        sim_noise = AerSimulator(noise_model=noise_model)
+        result_noise = sim_noise.run(transpiled_qc, shots=shots).result()
+        counts_noise = result_noise.get_counts()
+
+        fidelity = hellinger_fidelity(counts_ideal, counts_noise)
+        fidelities.append(fidelity)
+
+        success_hits = sum(counts_noise.get(peak, 0) for peak in valid_peaks)
+        success_prob = success_hits / shots
+        success_probs.append(success_prob)
+
+        print(f"{p:<15} | {fidelity:<12.4f} | {success_prob:.4f}")
+
+    # ==========================================
+    # 5. FIGURE GENERATION
+    # ==========================================
+    fig, ax1 = plt.subplots(figsize=(8, 6))
+
+    ax1.set_xlabel('Single-Qubit Depolarizing Error Rate ($p$)', fontsize=12)
+    ax1.set_ylabel('Success Probability', color='midnightblue', fontsize=12)
+    line1 = ax1.plot(error_rates, success_probs, marker='o', color='midnightblue', linewidth=2, label='Success Probability')
+    ax1.tick_params(axis='y', labelcolor='midnightblue')
+    ax1.set_xscale('log')
+
+    ax1.axhline(y=0.5, color='gray', linestyle='--', alpha=0.7, label='Viability Threshold ($0.5$)')
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Output Fidelity', color='crimson', fontsize=12)
+    line2 = ax2.plot(error_rates, fidelities, marker='s', color='crimson', linestyle='-.', linewidth=2, label='Fidelity vs Ideal')
+    ax2.tick_params(axis='y', labelcolor='crimson')
+
+    lines = line1 + [ax1.lines[1]] + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper right', fontsize=10)
+
+    plt.title("Noise Sensitivity Analysis: Regev's Algorithm ($N=15$)", fontsize=14, pad=15)
+    ax1.grid(True, which="both", ls="--", alpha=0.4)
+
+    plt.savefig('noise_sensitivity_regev.pdf', bbox_inches='tight', dpi=300)
+    print("\n[OK] Analysis finished. Figure saved as 'noise_sensitivity_regev.pdf'.")
+    plt.show()
