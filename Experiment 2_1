@@ -1,0 +1,129 @@
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from qiskit import QuantumCircuit, QuantumRegister
+from qiskit.circuit.library import QFT
+from qiskit.circuit import Gate
+
+# ==========================================
+# QUANTUM MODULES
+# ==========================================
+def discrete_gaussian_state(n: int, R: float) -> QuantumCircuit:
+    M_dim = 2 ** n
+    domain = np.arange(M_dim)
+    amplitudes = np.exp(-((domain - (M_dim / 2.0)) ** 2) / (R ** 2))
+    norm_factor = np.sqrt(np.sum(amplitudes ** 2))
+    qr = QuantumRegister(n, name='z')
+    qc = QuantumCircuit(qr)
+    qc.initialize(amplitudes / norm_factor, qr)
+    return qc
+
+def build_oracle_logical(bases: list, N: int, z_regs: list, out_reg: QuantumRegister, n: int) -> QuantumCircuit:
+    qc = QuantumCircuit(*z_regs, out_reg)
+    for dim_idx, (base, z_reg) in enumerate(zip(bases, z_regs)):
+        for bit_idx in range(z_reg.size):
+            power = 2 ** bit_idx
+            # Logical Black Box (Dummy Gate) to avoid memory overflow during synthesis
+            dummy_c_mult = Gate(name=f"c-*{base}^{power} mod {N}", num_qubits=out_reg.size + 1, params=[])
+            qc.append(dummy_c_mult, [z_reg[bit_idx]] + list(out_reg))
+    return qc
+
+def apply_multidimensional_qft(z_regs: list) -> QuantumCircuit:
+    qc = QuantumCircuit(*z_regs)
+    for z_reg in z_regs:
+        qft_inst = QFT(z_reg.size, do_swaps=False, inverse=False).to_instruction()
+        qc.append(qft_inst, z_reg)
+    return qc
+
+# Mathematical prime search engine
+def is_prime(num: int) -> bool:
+    if num < 2: return False
+    for i in range(2, int(math.sqrt(num)) + 1):
+        if num % i == 0: return False
+    return True
+
+# ==========================================
+# MASTER ANALYSIS FLOW (EXPERIMENT 2)
+# ==========================================
+if __name__ == "__main__":
+    study_cases = {4: 15, 6: 35, 8: 143, 10: 899, 12: 3599}
+    n_values = []
+    l_values = []
+
+    print("=========================================================================")
+    print(" EXECUTING INTEGRATED ANALYSIS: SCALABILITY AND POWER LAW")
+    print("=========================================================================")
+    print(f"{'Bits (n)':<10} | {'Logical Ops (L)':<15}")
+    print("-" * 35)
+
+    for n, N in study_cases.items():
+        d = max(2, math.ceil(math.sqrt(n)))
+
+        # Bases Search: Primes and coprimes to the target modulus N
+        bases = []
+        candidate = 2
+        while len(bases) < d:
+            if is_prime(candidate) and math.gcd(candidate, N) == 1:
+                bases.append(candidate)
+            candidate += 1
+
+        z_regs = [QuantumRegister(n, name=f'z{i}') for i in range(d)]
+        out_reg = QuantumRegister(n, name='out')
+        qc = QuantumCircuit(*z_regs, out_reg)
+
+        # M_dim = 2^n, using M_dim * 0.35 as the radius R
+        qc_gauss = discrete_gaussian_state(n, (2**n) * 0.35)
+        for z_reg in z_regs:
+            qc.compose(qc_gauss, qubits=z_reg, inplace=True)
+
+        qc.x(out_reg[0])
+
+        qc.compose(build_oracle_logical(bases, N, z_regs, out_reg, n), inplace=True)
+        qc.compose(apply_multidimensional_qft(z_regs), inplace=True)
+
+        # Extract macro-instruction depth
+        ops = sum(qc.count_ops().values())
+        n_values.append(n)
+        l_values.append(ops)
+        print(f"{n:<10} | {ops:<15}")
+
+    # ==========================================
+    # LOG-LOG PLOT
+    # ==========================================
+    def power_law(n, a, k):
+        return a * (n ** k)
+
+    popt, _ = curve_fit(power_law, n_values, l_values, p0=[1, 1.5])
+
+    # Figure generation
+    fig, ax = plt.subplots(figsize=(8, 6))
+    n_dense = np.linspace(min(n_values), max(n_values), 200)
+
+    # Theoretical Bound Baseline
+    alpha_ref = l_values[0] / (n_values[0]**1.5)
+    ax.plot(n_dense, alpha_ref * (n_dense**1.5), color='gray', linestyle=':', linewidth=2, label=r'Theoretical Bound $\mathcal{O}(n^{1.5})$')
+
+    # Empirical Fit
+    ax.plot(n_dense, power_law(n_dense, *popt), 'r--', linewidth=2, label=f'Empirical Fit ($k={popt[1]:.2f}$)')
+
+    # Raw Circuit Data
+    ax.scatter(n_values, l_values, color='midnightblue', s=100, zorder=5, edgecolors='black', label='Circuit Data')
+
+    ax.set_xscale('log', base=2)
+    ax.set_yscale('log', base=2)
+    ax.set_xticks(n_values)
+    ax.set_xticklabels([str(val) for val in n_values])
+
+    y_ticks = [10, 15, 20, 30, 40, 50, 60]
+    ax.set_yticks(y_ticks)
+    ax.set_yticklabels([str(val) for val in y_ticks])
+
+    ax.set_xlabel('Input size in bits ($n$)', fontsize=12)
+    ax.set_ylabel('Logical Depth ($L$)', fontsize=12)
+    ax.set_title("Asymptotic Scalability: Regev's Algorithm", fontsize=14, pad=15)
+    ax.legend(fontsize=11, loc='upper left')
+    ax.grid(True, which="both", ls="--", alpha=0.4)
+
+    plt.savefig('asymptotic_scalability_regev.pdf', bbox_inches='tight', dpi=300)
+    print("\n[OK] Analysis finished. Figure generated successfully.")
