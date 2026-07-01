@@ -1,0 +1,225 @@
+import math
+import numpy as np
+from fpylll import IntegerMatrix, LLL
+from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, transpile
+from qiskit_aer import AerSimulator
+from qiskit.circuit.library import UnitaryGate, QFT
+
+# ==========================================
+# MODULE 1: State Preparation
+# ==========================================
+def discrete_gaussian_state(n: int, R: float) -> QuantumCircuit:
+    M_dim = 2 ** n
+    domain = np.arange(M_dim)
+    center = M_dim / 2.0
+    amplitudes = np.exp(-((domain - center) ** 2) / (R ** 2))
+    norm_factor = np.sqrt(np.sum(amplitudes ** 2))
+
+    qr = QuantumRegister(n, name='z')
+    qc = QuantumCircuit(qr)
+    qc.initialize(amplitudes / norm_factor, qr)
+    return qc
+
+# ==========================================
+# MODULE 2: Quantum Oracle
+# ==========================================
+def create_modular_multiplier(base: int, power: int, N: int, num_out_qubits: int) -> UnitaryGate:
+    dim = 2 ** num_out_qubits
+    matrix = np.zeros((dim, dim))
+    multiplier = pow(base, power, N)
+    for i in range(dim):
+        if i < N:
+            mapped_val = (i * multiplier) % N
+            matrix[mapped_val, i] = 1.0
+        else:
+            matrix[i, i] = 1.0
+    return UnitaryGate(matrix, label=f"*{base}^{power} mod {N}")
+
+def build_oracle(bases: list, N: int, z_regs: list, out_reg: QuantumRegister) -> QuantumCircuit:
+    num_out = out_reg.size
+    qc = QuantumCircuit(*z_regs, out_reg)
+    for dim_idx, (base, z_reg) in enumerate(zip(bases, z_regs)):
+        for bit_idx in range(z_reg.size):
+            power = 2 ** bit_idx
+            mult_gate = create_modular_multiplier(base, power, N, num_out)
+            c_mult_gate = mult_gate.control(1)
+            qc.append(c_mult_gate, [z_reg[bit_idx]] + list(out_reg))
+    return qc
+
+# ==========================================
+# MODULE 3: Multidimensional QFT
+# ==========================================
+def apply_multidimensional_qft(z_regs: list) -> QuantumCircuit:
+    qc = QuantumCircuit(*z_regs)
+    for z_reg in z_regs:
+        num_qubits = z_reg.size
+        qft_inst = QFT(num_qubits, do_swaps=True, inverse=False).to_instruction()
+        qc.append(qft_inst, z_reg)
+    return qc
+
+# ==========================================
+# Prime search code
+# ==========================================
+def is_prime(num: int) -> bool:
+    if num < 2: return False
+    for i in range(2, int(math.sqrt(num)) + 1):
+        if num % i == 0: return False
+    return True
+
+# ==========================================
+# EXPERIMENT 5: MULTI-RUN SAMPLING & LLL
+# ==========================================
+if __name__ == "__main__":
+    # ==========================================
+    # DYNAMIC PARAMETERS & BASE SEARCH
+    # ==========================================
+    N = 15
+    n = N.bit_length()
+    num_out_qubits = n
+    d = max(2, math.ceil(math.sqrt(n)))
+
+    # Clean search engine aligned with Regev 2023
+    bases = []
+    candidate = 2
+    while len(bases) < d:
+        if is_prime(candidate) and math.gcd(candidate, N) == 1:
+            bases.append(candidate)
+        candidate += 1
+
+    M = 2 ** n # Spatial dimension modulus
+    R = float(M * 0.35)
+
+    # Strict parameters for Experiment 5 (m = d + 4)
+    m_samples = d + 4
+    trials = 20
+
+    print(f"--- AUTOMATIC CONFIGURATION FOR N={N} ---")
+    print(f"Qubits per register (n): {n}")
+    print(f"Dimensions (d): {d}")
+    print(f"Selected prime bases: {bases}")
+    print(f"Required LLL samples (m): {m_samples}")
+    print("-" * 43)
+
+    # ==========================================
+    # CIRCUIT ASSEMBLY
+    # ==========================================
+    print(f"\n--- QUANTUM PHASE: Building single circuit for N={N} ---")
+    z_regs = [QuantumRegister(n, name=f'z{i}') for i in range(len(bases))]
+    out_reg = QuantumRegister(num_out_qubits, name='out')
+    c_regs = [ClassicalRegister(n, name=f'c{i}') for i in range(len(bases))]
+
+    qc = QuantumCircuit(*z_regs, out_reg, *c_regs)
+
+    qc_gauss = discrete_gaussian_state(n, R)
+    for z_reg in z_regs:
+        qc.compose(qc_gauss, qubits=z_reg, inplace=True)
+
+    qc.x(out_reg[0])
+
+    oracle = build_oracle(bases, N, z_regs, out_reg)
+    qc.compose(oracle, inplace=True)
+
+    qft_block = apply_multidimensional_qft(z_regs)
+    qc.compose(qft_block, inplace=True)
+
+    for i, z_reg in enumerate(z_regs):
+        qc.measure(z_reg, c_regs[i])
+
+    print("Transpiling circuit (Optimization Level 3)...")
+    simulator = AerSimulator()
+    qc_transpiled = transpile(qc, simulator, optimization_level=3)
+
+    print(f"\n===========================================================")
+    print(f" CLASSICAL PHASE: ORCHESTRATION OF {trials} LLL TRIALS")
+    print(f"===========================================================")
+
+    success_count = 0
+    representative_log = {}
+
+    for trial in range(1, trials + 1):
+        # A. Draw exactly m_samples (6) shots for this independent trial
+        result = simulator.run(qc_transpiled, shots=m_samples, memory=True).result()
+        binary_samples = result.get_memory()
+
+        # B. Parse into integer measurement vectors (k_raw)
+        k_raw = []
+        for bitstring in binary_samples:
+            measurements = bitstring.split()
+            # measurements.reverse() # Removed to match Qiskit's Little-Endian format
+            vector = [int(m, 2) for m in measurements]
+            k_raw.append(vector)
+
+        # C. LLL Reduction (Kannan's Embedding for Bounded Distance Decoding)
+        total_dim = d + m_samples
+        K_matrix = IntegerMatrix(total_dim, total_dim)
+        S = 100000 # Algorithmic noise penalty scalar (formerly C)
+
+        for i in range(d):
+            K_matrix[i, i] = 1
+            for j, sample in enumerate(k_raw):
+                K_matrix[i, d + j] = int(S * sample[i] / M)
+
+        for j in range(m_samples):
+            K_matrix[d + j, d + j] = S
+
+        LLL.reduction(K_matrix)
+
+        # Extract the LLL-reduced basis for logging purposes
+        reduced_basis = [[K_matrix[i, j] for j in range(total_dim)] for i in range(total_dim)]
+
+        # D. Vector Evaluation and Factor Extraction
+        factor_found = False
+        for row_idx in range(total_dim):
+            candidate_vector = K_matrix[row_idx]
+            z_recovered = [candidate_vector[i] for i in range(d)]
+
+            if all(v == 0 for v in z_recovered): continue
+
+            z_abs = [abs(v) for v in z_recovered]
+            if any(coord % 2 != 0 for coord in z_abs): continue
+
+            b = 1
+            for i in range(d):
+                power = z_abs[i] // 2
+                b = (b * pow(bases[i], power, N)) % N
+
+            if (b * b) % N != 1: continue
+
+            if b != 1 and b != N - 1:
+                p = math.gcd(int(b - 1), N)
+                q = math.gcd(int(b + 1), N)
+                if 1 < p < N or 1 < q < N:
+                    factor_found = True
+                    success_count += 1
+
+                    if not representative_log:
+                        representative_log = {
+                            'trial': trial,
+                            'raw_vectors': k_raw,
+                            'reduced_basis': reduced_basis,
+                            'z': z_recovered, # FIXED
+                            'b': b,
+                            'factors': (p, q)
+                        }
+                    break
+
+    # 3. Print Results
+    print("-" * 65)
+    print(f"[+] Success rate after {trials} independent LLL trials: {(success_count/trials)*100:.2f}% ({success_count}/{trials})")
+    print("-" * 65)
+
+    if representative_log:
+        print(f"\n[*] REPRESENTATIVE TRIAL DETAIL (Trial #{representative_log['trial']}) FOR THE THESIS TEXT:")
+        print(" (i) Raw Measurement Vectors (k_1 ... k_6):")
+        for vec in representative_log['raw_vectors']:
+            print(f"     {vec}")
+
+        print("\n (ii) LLL-Reduced Basis (First 3 vectors of the extended matrix):")
+        for i in range(3):
+            print(f"      b_{i} = {representative_log['reduced_basis'][i]}")
+
+        print(f"\n (iii) Decoded Periodic Vector (z): {representative_log['z']}")
+        print(f" (iv) Extracted Modular Root (b): {representative_log['b']}")
+        print(f" (v) Computed GCD Factors: p={representative_log['factors'][0]}, q={representative_log['factors'][1]}")
+    else:
+        print("[-] Quantum statistics did not favor reduction in any trial. Re-run the execution.")

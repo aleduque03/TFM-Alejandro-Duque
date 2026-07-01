@@ -1,0 +1,262 @@
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, transpile
+from qiskit_aer import AerSimulator
+from qiskit_aer.noise import NoiseModel, depolarizing_error
+from qiskit.quantum_info import hellinger_fidelity
+from qiskit.circuit.library import UnitaryGate, QFT
+
+# ==========================================
+# MODULE 1: State Preparation
+# ==========================================
+def discrete_gaussian_state(n: int, R: float) -> QuantumCircuit:
+    M_dim = 2 ** n
+    domain = np.arange(M_dim)
+    center = M_dim / 2.0
+    amplitudes = np.exp(-((domain - center) ** 2) / (R ** 2))
+    norm_factor = np.sqrt(np.sum(amplitudes ** 2))
+    qr = QuantumRegister(n, name='z')
+    qc = QuantumCircuit(qr)
+    qc.initialize(amplitudes / norm_factor, qr)
+    return qc
+
+# ==========================================
+# MODULE 2: Quantum Oracle
+# ==========================================
+def create_modular_multiplier(base: int, power: int, N: int, num_out_qubits: int) -> UnitaryGate:
+    dim = 2 ** num_out_qubits
+    matrix = np.zeros((dim, dim))
+    multiplier = pow(base, power, N)
+    for i in range(dim):
+        if i < N:
+            mapped_val = (i * multiplier) % N
+            matrix[mapped_val, i] = 1.0
+        else:
+            matrix[i, i] = 1.0
+    return UnitaryGate(matrix, label=f"*{base}^{power} mod {N}")
+
+def build_oracle(bases: list, N: int, z_regs: list, out_reg: QuantumRegister) -> QuantumCircuit:
+    num_out = out_reg.size
+    qc = QuantumCircuit(*z_regs, out_reg)
+    for dim_idx, (base, z_reg) in enumerate(zip(bases, z_regs)):
+        for bit_idx in range(z_reg.size):
+            power = 2 ** bit_idx
+            mult_gate = create_modular_multiplier(base, power, N, num_out)
+            c_mult_gate = mult_gate.control(1)
+            qc.append(c_mult_gate, [z_reg[bit_idx]] + list(out_reg))
+    return qc
+
+# ==========================================
+# MODULE 3: Multidimensional QFT
+# ==========================================
+def apply_multidimensional_qft(z_regs: list) -> QuantumCircuit:
+    qc = QuantumCircuit(*z_regs)
+    for z_reg in z_regs:
+        num_qubits = z_reg.size
+        qft_inst = QFT(num_qubits, do_swaps=True, inverse=False).to_instruction()
+        qc.append(qft_inst, z_reg)
+    return qc
+
+# ==========================================
+# PRIME SEARCH CODE
+# ==========================================
+def is_prime(num: int) -> bool:
+    if num < 2: return False
+    for i in range(2, int(math.sqrt(num)) + 1):
+        if num % i == 0: return False
+    return True
+
+# ==========================================
+# CIRCUIT ASSEMBLY
+# ==========================================
+def build_regev_circuit(N=15):
+    n = N.bit_length()
+    d = max(2, math.ceil(math.sqrt(n)))
+    R = float((2 ** n) * 0.35)
+
+    bases = []
+    candidate = 2
+    while len(bases) < d:
+        if is_prime(candidate) and math.gcd(candidate, N) == 1:
+            bases.append(candidate)
+        candidate += 1
+
+    z_regs = [QuantumRegister(n, name=f'z{i}') for i in range(d)]
+    out_reg = QuantumRegister(n, name='out')
+    c_regs = [ClassicalRegister(n, name=f'c{i}') for i in range(d)]
+    qc = QuantumCircuit(*z_regs, out_reg, *c_regs)
+
+    qc_gauss = discrete_gaussian_state(n, R)
+    for z_reg in z_regs:
+        qc.compose(qc_gauss, qubits=z_reg, inplace=True)
+
+    qc.x(out_reg[0])
+
+    oracle = build_oracle(bases, N, z_regs, out_reg)
+    qc.compose(oracle, inplace=True)
+
+    qft_block = apply_multidimensional_qft(z_regs)
+    qc.compose(qft_block, inplace=True)
+
+    for i, z_reg in enumerate(z_regs):
+        qc.measure(z_reg, c_regs[i])
+
+    return qc
+
+def build_shor_circuit(N=15, a=7):
+    n_target = N.bit_length()
+    n_count = 2 * n_target # Shor requires 2n precision qubits
+
+    count_reg = QuantumRegister(n_count, name='count')
+    target_reg = QuantumRegister(n_target, name='target')
+    c_reg = ClassicalRegister(n_count, name='c')
+    qc = QuantumCircuit(count_reg, target_reg, c_reg)
+
+    qc.h(count_reg)
+    qc.x(target_reg[0])
+
+    num_out = target_reg.size
+    for i in range(n_count):
+        power = 2 ** i
+        mult_gate = create_modular_multiplier(a, power, N, num_out).control(1)
+        qc.append(mult_gate, [count_reg[i]] + list(target_reg))
+
+    iqft_inst = QFT(n_count, do_swaps=True, inverse=True).to_instruction()
+    qc.append(iqft_inst, count_reg)
+    qc.measure(count_reg, c_reg)
+
+    return qc
+
+# ==========================================
+# EXPERIMENT 4: SHOR VS REGEV
+# ==========================================
+if __name__ == "__main__":
+    N_val = 15
+    shots = 100
+    error_rates = [1e-4, 1e-3, 1e-2, 5e-2]
+
+    print("\n" + "="*80)
+    print(" EXPERIMENT 4: REGEV VS SHOR COMPARISON (N=15)")
+    print("="*80 + "\n")
+
+    qc_regev = build_regev_circuit(N_val)
+    qc_shor = build_shor_circuit(N_val, a=7)
+
+    simulator = AerSimulator()
+    print("[*] Transpiling circuits (Optimization Level 3)...")
+
+    tc_regev = transpile(qc_regev, simulator, optimization_level=3)
+    tc_shor = transpile(qc_shor, simulator, optimization_level=3)
+
+    depth_r, ops_r = tc_regev.depth(), sum(tc_regev.count_ops().values())
+    depth_s, ops_s = tc_shor.depth(), sum(tc_shor.count_ops().values())
+
+    # Dynamic gate extraction for accurate noise modeling
+    def get_gates(tc):
+        p1q, p2q = set(), set()
+        for inst in tc.data:
+            if inst.operation.name not in ['measure', 'barrier']:
+                if inst.operation.num_qubits == 1: p1q.add(inst.operation.name)
+                elif inst.operation.num_qubits == 2: p2q.add(inst.operation.name)
+        return list(p1q), list(p2q)
+
+    p1_r, p2_r = get_gates(tc_regev)
+    p1_s, p2_s = get_gates(tc_shor)
+
+    print("[*] Executing Ideal Simulations (Baseline)...")
+    res_id_r = simulator.run(tc_regev, shots=10000).result().get_counts()
+    res_id_s = simulator.run(tc_shor, shots=10000).result().get_counts()
+
+    valid_peaks_r = {k for k, v in res_id_r.items() if (v / sum(res_id_r.values())) > 0.01}
+    valid_peaks_s = {k for k, v in res_id_s.items() if (v / sum(res_id_s.values())) > 0.01}
+
+    print("[*] Starting depolarizing noise sweep...")
+    success_r, success_s = [], []
+    fid_r_list, fid_s_list = [], []
+
+    for p in error_rates:
+        noise_r, noise_s = NoiseModel(), NoiseModel()
+        e1, e2 = depolarizing_error(p, 1), depolarizing_error(min(p*10, 1.0), 2)
+
+        if p1_r: noise_r.add_all_qubit_quantum_error(e1, p1_r)
+        if p2_r: noise_r.add_all_qubit_quantum_error(e2, p2_r)
+
+        if p1_s: noise_s.add_all_qubit_quantum_error(e1, p1_s)
+        if p2_s: noise_s.add_all_qubit_quantum_error(e2, p2_s)
+
+        sim_r = AerSimulator(noise_model=noise_r)
+        sim_s = AerSimulator(noise_model=noise_s)
+
+        counts_r = sim_r.run(tc_regev, shots=shots).result().get_counts()
+        counts_s = sim_s.run(tc_shor, shots=shots).result().get_counts()
+
+        # Success probabilities
+        succ_r = sum(counts_r.get(k, 0) for k in valid_peaks_r) / shots
+        succ_s = sum(counts_s.get(k, 0) for k in valid_peaks_s) / shots
+        success_r.append(succ_r)
+        success_s.append(succ_s)
+
+        # Fidelities
+        fid_r = hellinger_fidelity(res_id_r, counts_r)
+        fid_s = hellinger_fidelity(res_id_s, counts_s)
+        fid_r_list.append(fid_r)
+        fid_s_list.append(fid_s)
+
+    # ------------------------------------------------------------------
+    # APPENDIX C TABLES (FULL NOISE-SWEEP DATA)
+    # ------------------------------------------------------------------
+    print("\n" + "="*65)
+    print(" APPENDIX C: FULL NOISE-SWEEP DATA TABLES")
+    print("="*65)
+
+    print("\n[TABLE C.1] Regev's Algorithm Noise Sweep (N=15, d=2)")
+    print(f"{'Error Rate (p)':<15} | {'Hellinger Fidelity':<20} | {'Success Probability'}")
+    print("-" * 65)
+    for p, f, s in zip(error_rates, fid_r_list, success_r):
+        print(f"{p:<15} | {f:<20.4f} | {s:.4f}")
+
+    print("\n[TABLE C.2] Shor's Algorithm Noise Sweep (N=15, a=7)")
+    print(f"{'Error Rate (p)':<15} | {'Hellinger Fidelity':<20} | {'Success Probability'}")
+    print("-" * 65)
+    for p, f, s in zip(error_rates, fid_s_list, success_s):
+        print(f"{p:<15} | {f:<20.4f} | {s:.4f}")
+
+    # ------------------------------------------------------------------
+    # SECTION 5.5 TABLE
+    # ------------------------------------------------------------------
+    print("\n" + "="*65)
+    print(" TABLE 5.6: EMPIRICAL COMPARISON (REGEV VS SHOR FOR N=15)")
+    print("="*65)
+    print(f"{'Metric':<25} | {'Regev':<10} | {'Shor':<10} | {'Ratio (Shor/Regev)'}")
+    print("-" * 65)
+    print(f"{'Gate count':<25} | {ops_r:<10} | {ops_s:<10} | {ops_s/ops_r:.2f}x")
+    print(f"{'Circuit depth':<25} | {depth_r:<10} | {depth_s:<10} | {depth_s/depth_r:.2f}x")
+    print(f"{'Qubits':<25} | {qc_regev.num_qubits:<10} | {qc_shor.num_qubits:<10} | {qc_shor.num_qubits/qc_regev.num_qubits:.2f}x")
+
+    print(f"{'Success prob. (p=0)':<25} | {sum(res_id_r.values())/10000:<10.4f} | {sum(res_id_s.values())/10000:<10.4f} | -")
+
+    idx_1e3 = error_rates.index(1e-3)
+    p_1e3_r, p_1e3_s = success_r[idx_1e3], success_s[idx_1e3]
+    ratio_succ = (p_1e3_s / p_1e3_r) if p_1e3_r > 0 else float('inf')
+
+    print(f"{'Success prob. (p=10^-3)':<25} | {p_1e3_r:<10.4f} | {p_1e3_s:<10.4f} | {ratio_succ:.2f}x")
+    print("-" * 65)
+
+    # COMPARATIVE PLOT GENERATION
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.plot(error_rates, success_r, marker='o', color='midnightblue', linewidth=2, label="Regev's Algorithm (d=2)")
+    ax.plot(error_rates, success_s, marker='s', color='crimson', linestyle='--', linewidth=2, label="Shor's Algorithm")
+
+    ax.axhline(y=0.5, color='gray', linestyle=':', alpha=0.8, label='Viability Threshold (0.5)')
+
+    ax.set_xscale('log')
+    ax.set_xlabel('Single-Qubit Depolarizing Error Rate ($p$)', fontsize=12)
+    ax.set_ylabel('Success Probability', fontsize=12)
+    ax.set_title("Noise Resilience: Regev vs. Shor ($N=15$)", fontsize=14, pad=15)
+    ax.grid(True, which="both", ls="--", alpha=0.4)
+    ax.legend(loc='upper right', fontsize=11)
+
+    plt.savefig('shor_vs_regev_noise.pdf', bbox_inches='tight', dpi=300)
+    print("\n[OK] Plot saved as 'shor_vs_regev_noise.pdf'.")
+    plt.show()
